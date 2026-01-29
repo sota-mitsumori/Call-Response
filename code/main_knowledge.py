@@ -15,10 +15,6 @@ import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import Dataset, DataLoader
 
-from fast_transformers.builders import TransformerEncoderBuilder, TransformerDecoderBuilder
-from fast_transformers.builders import RecurrentEncoderBuilder, RecurrentDecoderBuilder
-from fast_transformers.masking import TriangularCausalMask, LengthMask
-
 import miditoolkit
 from miditoolkit.midi.containers import Marker, Instrument, TempoChange, Note
 
@@ -237,57 +233,35 @@ class TransformerModel(nn.Module):
         self.word_emb_velocity  = Embeddings(self.n_token[6], self.emb_sizes[6])
         self.pos_emb            = PositionalEncoding(self.d_model, self.dropout)
 
-        # linear
+         # linear
         self.in_linear = nn.Linear(np.sum(self.emb_sizes), self.d_model)
-        self.linear_knowledge = nn.Linear(self.d_model*2, self.d_model)
-        self.knowledge_selector=KnowledgeSelector(self.d_model)
-         # encoder
-        if is_training:
-            # encoder (training)
-            self.transformer_encoder = TransformerEncoderBuilder.from_kwargs(
-                n_layers=self.n_layer,
-                n_heads=self.n_head,
-                query_dimensions=self.d_model//self.n_head,
-                value_dimensions=self.d_model//self.n_head,
-                feed_forward_dimensions=2048,
-                activation='gelu',
-                dropout=0.1,
-                attention_type="full",
-            ).get()
-            self.transformer_decoder=TransformerDecoderBuilder.from_kwargs(
-                            n_layers=self.n_layer,
-                            n_heads=self.n_head,
-                            query_dimensions=self.d_model//self.n_head,
-                            value_dimensions=self.d_model//self.n_head,
-                            feed_forward_dimensions=2048,
-                            activation='gelu',
-                            dropout=0.1,
-                            self_attention_type="full",
-                            cross_attention_type="full"
-                        ).get()
-        else:
-            # encoder (inference)
-            self.transformer_encoder = TransformerEncoderBuilder.from_kwargs(
-                n_layers=self.n_layer,
-                n_heads=self.n_head,
-                query_dimensions=self.d_model//self.n_head,
-                value_dimensions=self.d_model//self.n_head,
-                feed_forward_dimensions=2048,
-                activation='gelu',
-                dropout=0.1,
-                attention_type="full",
-            ).get()
-            self.transformer_decoder = RecurrentDecoderBuilder.from_kwargs(
-                n_layers=self.n_layer,
-                n_heads=self.n_head,
-                query_dimensions=self.d_model//self.n_head,
-                value_dimensions=self.d_model//self.n_head,
-                feed_forward_dimensions=2048,
-                activation='gelu',
-                dropout=0.1,
-                self_attention_type="full",
-                cross_attention_type="full"
-            ).get()
+        self.linear_knowledge = nn.Linear(self.d_model * 2, self.d_model)
+        self.knowledge_selector = KnowledgeSelector(self.d_model)
+
+        # PyTorch Transformer encoder/decoder (batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=self.n_head,
+            dim_feedforward=self.d_inner,
+            dropout=0.1,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=self.n_layer
+        )
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=self.n_head,
+            dim_feedforward=self.d_inner,
+            dropout=0.1,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=self.n_layer
+        )
         # blend with type
         self.project_concat_type = nn.Linear(self.d_model + 32, self.d_model)
 
@@ -302,8 +276,10 @@ class TransformerModel(nn.Module):
     def compute_loss(self, predict, target, loss_mask):
         loss = self.loss_func(predict, target)
         loss = loss * loss_mask
-        loss = torch.sum(loss) / torch.sum(loss_mask)
-        return loss
+        denom = torch.sum(loss_mask)
+        if denom <= 0:
+            return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+        return torch.sum(loss) / denom
     def compute_loss_class(self, predict, label):
         loss = self.loss_func(predict, label)
         # print('loss',loss)
@@ -344,11 +320,10 @@ class TransformerModel(nn.Module):
         return loss_tempo, loss_chord, loss_barbeat, loss_type, loss_pitch, loss_duration, loss_velocity
 
     def forward_hidden(self, x, src_mask):
-        '''
-        linear transformer: b x s x f
-        x.shape=(bs, nf)
-        '''
-
+        """
+        x: (B, L, 7)
+        src_mask: list[int]  各バッチの有効長 (EOS などの手前の長さ)
+        """
         # embeddings
         emb_tempo =    self.word_emb_tempo(x[..., 0])
         emb_chord =    self.word_emb_chord(x[..., 1])
@@ -367,25 +342,33 @@ class TransformerModel(nn.Module):
                 emb_pitch,
                 emb_duration,
                 emb_velocity,
-            ], dim=-1)
+            ], dim=-1
+        )
 
-        emb_linear = self.in_linear(embs)
-        pos_emb = self.pos_emb(emb_linear)
+        emb_linear = self.in_linear(embs)          # (B, L, d_model)
+        pos_emb = self.pos_emb(emb_linear)         # (B, L, d_model)
 
-        length_mask=LengthMask(torch.LongTensor(src_mask).to('cuda'),256)
+        # src_key_padding_mask: True が「無効（pad）」の位置
+        B, L, _ = pos_emb.shape
+        lengths = torch.tensor(src_mask, device=pos_emb.device, dtype=torch.long)  # (B,)
+        lengths = lengths.clamp(min=1)  # 0 だと全マスクになり MPS で NaN になりうる
+        src_key_padding_mask = (
+            torch.arange(L, device=pos_emb.device).unsqueeze(0) >= lengths.unsqueeze(1)
+        )  # (B, L)
 
-        h = self.transformer_encoder(pos_emb,length_mask=length_mask) # y: b x s x d_model
-
-        # y_type = self.proj_type(h)
-
-        # project type
+        h = self.transformer_encoder(
+            pos_emb,
+            src_key_padding_mask=src_key_padding_mask,
+        )  # (B, L, d_model)
         return h
 
-    def forward_output(self, h, y,tgt_mask,label):
-        '''
-        for training
-        '''
-
+    def forward_output(self, h, y, tgt_mask, label):
+        """
+        h: encoder 出力 (B, L_src, d_model)
+        y: decoder 入力系列 (B, L_tgt, 7)
+        tgt_mask: list[int]  各バッチの有効長
+        label: 教師ラベル (B, L_tgt, 7)
+        """
         emb_tempo =    self.word_emb_tempo(y[..., 0])
         emb_chord =    self.word_emb_chord(y[..., 1])
         emb_barbeat =  self.word_emb_barbeat(y[..., 2])
@@ -403,20 +386,42 @@ class TransformerModel(nn.Module):
                 emb_pitch,
                 emb_duration,
                 emb_velocity,
-            ], dim=-1)
+            ], dim=-1
+        )
 
         emb_linear = self.in_linear(embs)
-        pos_emb = self.pos_emb(emb_linear)
+        pos_emb = self.pos_emb(emb_linear)  # (B, L_tgt, d_model)
 
-        attn_mask = TriangularCausalMask(pos_emb.size(1), device=y.device)
-        length_mask=LengthMask(torch.LongTensor(tgt_mask).to('cuda'),256)
+        B, L_tgt, _ = pos_emb.shape
 
-        h = self.transformer_decoder(pos_emb,h,x_mask=attn_mask,x_length_mask=length_mask)
-        y_type = self.proj_type(h)
+        # 因果マスク (L_tgt, L_tgt), 上三角を大きな負値にする (MPS では -inf が NaN の原因になることがある)
+        _NEG_INF = -1e9
+        attn_mask = torch.triu(
+            torch.full((L_tgt, L_tgt), _NEG_INF, device=pos_emb.device, dtype=pos_emb.dtype),
+            diagonal=1,
+        )
+
+        # tgt_key_padding_mask: True が pad の位置
+        lengths = torch.tensor(tgt_mask, device=pos_emb.device, dtype=torch.long)  # (B,)
+        lengths = lengths.clamp(min=1)  # 0 だと全マスクになり MPS で NaN になりうる
+        tgt_key_padding_mask = (
+            torch.arange(L_tgt, device=pos_emb.device).unsqueeze(0)
+            >= lengths.unsqueeze(1)
+        )  # (B, L_tgt)
+
+        # decoder
+        h_dec = self.transformer_decoder(
+            tgt=pos_emb,
+            memory=h,
+            tgt_mask=attn_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            # memory_key_padding_mask は forward_hidden 内で既にマスクしているので省略
+        )  # (B, L_tgt, d_model)
+
+        y_type = self.proj_type(h_dec)
         tf_skip_type = self.word_emb_type(label[..., 3])
-        # project other
-        y_concat_type = torch.cat([h, tf_skip_type], dim=-1)
-        y_  = self.project_concat_type(y_concat_type)
+        y_concat_type = torch.cat([h_dec, tf_skip_type], dim=-1)
+        y_ = self.project_concat_type(y_concat_type)
 
         y_tempo    = self.proj_tempo(y_)
         y_chord    = self.proj_chord(y_)
@@ -425,13 +430,13 @@ class TransformerModel(nn.Module):
         y_duration = self.proj_duration(y_)
         y_velocity = self.proj_velocity(y_)
 
-        return  y_tempo, y_chord, y_barbeat,y_type,y_pitch, y_duration, y_velocity
-
-    def forward_output_sampling(self, h, memory,y):
-        '''
-        for inference
-        '''
-        # sample type
+        return y_tempo, y_chord, y_barbeat, y_type, y_pitch, y_duration, y_velocity
+     
+    def forward_output_sampling(self, h, memory, y):
+        """
+        推論用: y は現在のデコード系列 (B, L_tgt, 7) だが、
+        このコードでは常に L_tgt = 1（1ステップずつ）で呼ばれている。
+        """
         emb_tempo =    self.word_emb_tempo(y[..., 0])
         emb_chord =    self.word_emb_chord(y[..., 1])
         emb_barbeat =  self.word_emb_barbeat(y[..., 2])
@@ -449,30 +454,44 @@ class TransformerModel(nn.Module):
                 emb_pitch,
                 emb_duration,
                 emb_velocity,
-            ], dim=-1)
+            ], dim=-1
+        )
 
         emb_linear = self.in_linear(embs)
-        pos_emb = self.pos_emb(emb_linear)
+        pos_emb = self.pos_emb(emb_linear)  # (B, 1, d_model) の想定
 
-        attn_mask = TriangularCausalMask(pos_emb.size(1), device=y.device)
+        # 1 ステップなので因果マスクは不要だが、一般性のために一応入れてもよい
+        B, L_tgt, _ = pos_emb.shape
+        if L_tgt > 1:
+            _NEG_INF = -1e9
+            attn_mask = torch.triu(
+                torch.full((L_tgt, L_tgt), _NEG_INF, device=pos_emb.device, dtype=pos_emb.dtype),
+                diagonal=1,
+            )
+        else:
+            attn_mask = None
 
+        h_dec = self.transformer_decoder(
+            tgt=pos_emb,
+            memory=h,
+            tgt_mask=attn_mask,
+        )  # (B, L_tgt, d_model)
 
+        # 最後のステップだけ取り出す (B, d_model)
+        last = h_dec[:, -1, :].unsqueeze(1)  # (B, 1, d_model)
 
-        pos_emb = pos_emb.squeeze(0)
-        y_,memory = self.transformer_decoder(pos_emb, h,memory_length_mask=attn_mask,state=memory) # y: s x d_model
-        y_type = self.proj_type(y_)
+        y_type = self.proj_type(last)
+        y_type_logit = y_type[0, 0, :]  # バッチサイズ1前提
 
-        y_type_logit = y_type[0, :]
         cur_word_type = sampling(y_type_logit, p=0.90)
 
         type_word_t = torch.from_numpy(
-                    np.array([cur_word_type])).long().cuda().unsqueeze(0)
+            np.array([cur_word_type])
+        ).long().to(h.device).unsqueeze(0)  # (1, 1)
 
-        tf_skip_type = self.word_emb_type(type_word_t).squeeze(0)
-
-        # concat
-        y_concat_type = torch.cat([y_, tf_skip_type], dim=-1)
-        y_  = self.project_concat_type(y_concat_type)
+        tf_skip_type = self.word_emb_type(type_word_t)  # (1, 1, emb_dim)
+        y_concat_type = torch.cat([last, tf_skip_type], dim=-1)
+        y_ = self.project_concat_type(y_concat_type)  # (1, 1, d_model)
 
         # project other
         y_tempo    = self.proj_tempo(y_)
@@ -483,15 +502,13 @@ class TransformerModel(nn.Module):
         y_velocity = self.proj_velocity(y_)
 
         # sampling gen_cond
-        cur_word_tempo =    sampling(y_tempo, t=1.2, p=0.9)
-        cur_word_barbeat =  sampling(y_barbeat, t=1.2)
-        cur_word_chord =    sampling(y_chord, p=0.99)
-        # cur_word_type = sampling(y_type, p=0.90)
-        cur_word_pitch =    sampling(y_pitch, p=0.9)
-        cur_word_duration = sampling(y_duration, t=2, p=0.9)
-        cur_word_velocity = sampling(y_velocity, t=5)
+        cur_word_tempo    = sampling(y_tempo[0, 0, :], t=1.2, p=0.9)
+        cur_word_barbeat  = sampling(y_barbeat[0, 0, :], t=1.2)
+        cur_word_chord    = sampling(y_chord[0, 0, :], p=0.99)
+        cur_word_pitch    = sampling(y_pitch[0, 0, :], p=0.9)
+        cur_word_duration = sampling(y_duration[0, 0, :], t=2, p=0.9)
+        cur_word_velocity = sampling(y_velocity[0, 0, :], t=5)
 
-        # collect
         next_arr = np.array([
             cur_word_tempo,
             cur_word_chord,
@@ -500,8 +517,10 @@ class TransformerModel(nn.Module):
             cur_word_pitch,
             cur_word_duration,
             cur_word_velocity,
-            ])
-        return next_arr,memory
+        ])
+
+        # Recurrent state は使わないので memory=None を返す
+        return next_arr, None
 
     def inference(self, src,src_mask,dictionary,knowledge_base=None):
         event2word, word2event = dictionary
@@ -525,9 +544,9 @@ class TransformerModel(nn.Module):
             h = None
 
             cnt_bar = 1
-            init_t = torch.from_numpy(init).long().unsqueeze(0).cuda()
+            init_t = torch.from_numpy(init).long().unsqueeze(0).to(src.device)
             h = self.forward_hidden(
-                    src,src_mask)
+                    src, src_mask)
 
             if knowledge_base is not None:
                 knowledge_info= self.knowledge_selector(h,knowledge_base)
@@ -543,8 +562,8 @@ class TransformerModel(nn.Module):
                 print_word_cp(next_arr)
 
                 # forward
-                input_ = torch.from_numpy(next_arr).long().cuda()
-                input_  = input_.unsqueeze(0).unsqueeze(0)
+                input_ = torch.from_numpy(next_arr).long().to(src.device)
+                input_ = input_.unsqueeze(0).unsqueeze(0)
 
 
                 # end of sequence

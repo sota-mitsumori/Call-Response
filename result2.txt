@@ -1,0 +1,33 @@
+>>>>>: [234, 135, 18, 7, 130, 22, 130]
+[*] load model from: ./exp/loss_high_epoch_4_params.pt
+TransformerModel(
+  (loss_func): CrossEntropyLoss()
+  (word_emb_tempo): Embeddings(
+    (lut): Embedding(234, 512)
+  )
+  (word_emb_chord): Embeddings(
+    (lut): Embedding(135, 256)
+  )
+  (word_emb_barbeat): Embeddings(
+    (lut): Embedding(18, 64)
+  )
+  (word_emb_type): Embeddings(
+    (lut): Embedding(7, 32)
+  )
+  (word_emb_pitch): Embeddings(
+    (lut): Embedding(130, 512)
+  )
+  (word_emb_duration): Embeddings(
+    (lut): Embedding(22, 128)
+  )
+  (word_emb_velocity): Embeddings(
+    (lut): Embedding(130, 512)
+  )
+  (pos_emb): PositionalEncoding(
+    (dropout): Dropout(p=0.1, inplace=False)
+...
+  (proj_type): Linear(in_features=512, out_features=7, bias=True)
+  (proj_pitch): Linear(in_features=512, out_features=130, bias=True)
+  (proj_duration): Linear(in_features=512, out_features=22, bias=True)
+  (proj_velocity): Linear(in_features=512, out_features=130, bias=True)
+)
